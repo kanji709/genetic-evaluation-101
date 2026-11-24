@@ -1,16 +1,32 @@
-# Rendered tutorial and Quarto build files (rebuild with: quarto render tutorial.qmd)
-tutorial.html
-tutorial_files/
-tutorial_cache/
-.quarto/
-
-# Files written by the lesson scripts
-output/
-blupf90/
-
-# R / RStudio / OS
+# R
 .Rhistory
 .RData
 .Rproj.user/
-Rplots.pdf
+.Ruserdata
+*.Rproj
+renv/library/
+renv/staging/
+
+# Quarto / R Markdown outputs
+/.quarto/
+_site/
+_freeze/
+*_files/
+*.html
+*.knit.md
+
+# Python (if notebooks are added later)
+__pycache__/
+.ipynb_checkpoints/
+.venv/
+
+# Large or private data — keep only small simulated data in the repo
+data/private/
+*.rds
+*.bin
+
+# OS / editor
 .DS_Store
+Thumbs.db
+.vscode/
+.idea/
