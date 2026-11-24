@@ -1,6 +1,6 @@
 # Contributing
 
-Thanks for helping improve Genetic Evaluation 101. Students and interns are encouraged to contribute — spotting a confusing explanation is just as valuable as adding new material.
+Thanks for helping improve this course. Students and interns are encouraged to contribute — spotting a confusing explanation is just as valuable as adding new material.
 
 ## Quick fixes (typos, unclear wording)
 
@@ -10,20 +10,20 @@ Open the file on GitHub, click the pencil icon, make the change and propose it a
 
 Open an [issue](https://github.com/kanji709/genetic-evaluation-101/issues) describing:
 
-- which module and section it relates to
+- which lesson (and script or section of `tutorial.qmd`) it relates to
 - what was unclear or wrong
 - (optional) how you would fix it
 
-## Adding content
+## Changing the course
 
-1. Fork the repo and create a branch: `git checkout -b module-04-reml-example`
-2. Keep to the module template: *Learning objectives → Core concepts → Worked example → Exercises → Further reading*
-3. Code should run from the repository root on a fresh R session, using only the data in `data/` and packages listed in `install.R`
-4. Use **simulated or public data only**. Never commit real animal, farm or client data
-5. Open a pull request with a short description of what you changed
+1. Fork the repo and create a branch, e.g. `git checkout -b lesson-03-reml-note`
+2. Follow "Editing the course" in the README:
+   - change functions in `R/functions.R`, then run `Rscript tools/sync_functions.R`
+   - edit text and exercises directly in `tutorial.qmd`
+   - if you change the simulation, delete `tutorial_cache/` and run `Rscript 00_simulate_data.R`
+3. Check that `quarto render tutorial.qmd` succeeds and the lesson scripts run in order from the repository root
+4. Open a pull request with a short description of what you changed
 
-## Style
+## Data
 
-- Plain language first, equation second, code third
-- Define every symbol the first time it appears
-- Keep examples small enough to check by hand (≤ 10 animals where possible)
+Use **simulated or openly licensed data only**. Never commit real animal, farm or client records.

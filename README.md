@@ -80,3 +80,12 @@ with BLUPF90+ on macOS: pedigree BLUP and ssGBLUP solutions match the R lessons 
 
 Mrode, R. A. (2014). *Linear Models for the Prediction of Animal Breeding Values*, 3rd ed. CABI.
 The full reading list is at the end of the tutorial.
+
+## Contributing
+
+Corrections and suggestions are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md).
+
+## Licence
+
+Code is released under the [MIT License](LICENSE). Tutorial text and figures are released under
+[CC BY 4.0](https://creativecommons.org/licenses/by/4.0/).
