@@ -1,0 +1,1285 @@
+---
+title: "Breeding Values from Scratch"
+subtitle: "BLUP, GBLUP and single-step GBLUP in plain R"
+description: "A hands-on course for interns and summer students. Basic R needed, no genetics."
+format:
+  html:
+    toc: true
+    toc-depth: 2
+    toc-location: left
+    number-sections: false
+    embed-resources: true
+    code-tools: false
+    code-overflow: wrap
+    df-print: kable
+    theme:
+      light: flatly
+      dark: darkly
+    fig-width: 7
+    fig-height: 4.5
+    fig-align: center
+execute:
+  warning: false
+  message: false
+---
+
+```{r}
+#| label: setup
+#| include: false
+options(digits = 4, width = 90)
+f1 <- function(x) sprintf("%.1f", x)
+f2 <- function(x) sprintf("%.2f", x)
+f3 <- function(x) sprintf("%.3f", x)
+```
+
+# About this course {.unnumbered}
+
+You will run a genetic evaluation in R, then upgrade it with DNA: pedigree **BLUP**, then genomic **GBLUP**, then **single-step GBLUP** (ssGBLUP). Every method is checked against a simulated herd where the true answer is known.
+
+**What you need:** R 4.0 or later; RStudio or Positron is recommended. The analysis uses base R only. This document is self-contained: it simulates its own data and defines every function it uses, so it renders on its own with `quarto render tutorial.qmd` (Quarto plus the R packages `knitr` and `rmarkdown`).
+
+**How to work:** read a lesson here, then open the matching R script, run it line by line (`Ctrl/Cmd + Enter`) and do the exercises. Each set of exercises has an answer box below it; open it only after you have tried. The scripts use the same code and data, saved as files in the `blup_tutorial` folder. Set R's working directory to that folder first. If an exercise asks you to change a script, change it back afterwards, because later lessons read the files earlier ones write.
+
+| Lesson | Topic | Script |
+|---|---|---|
+| 1 | Breeding values and relatives | `01_relationships.R` |
+| 2 | BLUP by hand | `02_blup_by_hand.R` |
+| 3 | A full herd evaluation | `03_blup_herd.R` |
+| 4 | GBLUP: using DNA | `04_gblup.R` |
+| 5 | Single-step GBLUP | `05_ssgblup.R` |
+| 6 | Which method wins? | `06_compare.R`, `06b_replicates.R` |
+| 7 | Your own data and BLUPF90 | `07_export_blupf90.R` |
+
+# Lesson 1: Breeding values and relatives {#sec-l1}
+
+## What is a breeding value?
+
+A calf's weaning weight depends on many things: its herd, the year, whether it is a bull or a heifer, its mother's milk, and its genes. Only the genes are passed on. An animal's **breeding value** is the value of its genes to its offspring. Each parent passes on a random half of its genes, so on average an offspring is half its sire's breeding value plus half its dam's breeding value away from the population average. Breeding values are measured in the trait's own units (kg).
+
+For a made-up calf:
+
+$$
+\underbrace{281.0}_{\text{measured weight}} =
+\underbrace{252.8}_{\text{herd and year}} +
+\underbrace{15.4}_{\text{male calf}} +
+\underbrace{\color{green}{8.0}}_{\text{breeding value}} +
+\underbrace{4.8}_{\text{everything else}}
+$$
+
+We only ever see the left side. A **genetic evaluation** splits each measurement into these pieces so animals can be ranked on the inherited part. The estimate is an **EBV** (estimated breeding value), or a **GEBV** when DNA was used.
+
+Two ideas do all the work:
+
+- **Heritability (h²)** is the share of the differences between animals, after correcting for herd, year and sex, that is due to the genes they pass on (additive genetic effects). Weaning weight here has h² = 0.30: a calf 10 kg above its group average is expected to be only about 3 kg better genetically, judged on its own record alone. This "shrinking" is deliberate.
+- **Relatives share genes.** A heifer's weight also tells us something about her sire, her half sisters and her future calves. BLUP pools all that evidence, weighted by how related the animals are. Information from relatives can move an EBV further than the animal's own record would.
+
+## Pedigrees
+
+A **pedigree** lists each animal with its sire (father) and dam (mother). We start with the small pedigree from Mrode (2014), Example 3.1, so you can check every number against the textbook.
+
+```{mermaid}
+%%| fig-cap: "Pedigree of 8 animals. Boxes are males, rounded shapes females. Calves 4 to 8 have a pre-weaning gain record."
+flowchart TB
+  q(["dam unknown"]):::unk
+  n1["1 ♂"]
+  n2(["2 ♀"])
+  n3["3 ♂"]
+  n4["4 ♂ · 4.5 kg"]
+  n5(["5 ♀ · 2.9 kg"])
+  n6(["6 ♀ · 3.9 kg"])
+  n7["7 ♂ · 3.5 kg"]
+  n8["8 ♂ · 5.0 kg"]
+  n1 --> n4
+  q -.-> n4
+  n3 --> n5
+  n2 --> n5
+  n1 --> n6
+  n2 --> n6
+  n4 --> n7
+  n5 --> n7
+  n3 --> n8
+  n6 --> n8
+  classDef unk stroke-dasharray: 5 5
+```
+
+Software first sorts the pedigree so parents come before offspring and replaces names by row numbers (**renumbering**):
+
+```{r}
+#| label: fn-prepare_pedigree
+# Input : data.frame with columns id, sire, dam (unknown parent = "0" or NA),
+#         plus any other columns (sex, generation, ...) which are kept.
+# Output: the pedigree sorted so parents come before their offspring, with
+#         integer codes n (row number), s (sire row), d (dam row); 0 = unknown.
+prepare_pedigree <- function(ped) {
+  ped <- as.data.frame(ped, stringsAsFactors = FALSE)
+  for (v in c("id", "sire", "dam")) ped[[v]] <- as.character(ped[[v]])
+  ped$sire[is.na(ped$sire) | ped$sire == ""] <- "0"
+  ped$dam[is.na(ped$dam)   | ped$dam  == ""] <- "0"
+  if (any(duplicated(ped$id))) stop("Duplicated IDs in pedigree: ",
+                                    paste(head(ped$id[duplicated(ped$id)]), collapse = ", "))
+
+  # Parents listed as sire/dam but without a row of their own become founders
+  missing_parents <- setdiff(unique(c(ped$sire, ped$dam)), c("0", ped$id))
+  if (length(missing_parents) > 0) {
+    add <- ped[rep(NA_integer_, length(missing_parents)), , drop = FALSE]
+    add$id <- missing_parents; add$sire <- "0"; add$dam <- "0"
+    ped <- rbind(add, ped)
+  }
+
+  # Generation number: founders = 0, otherwise 1 + the younger parent's number
+  n  <- nrow(ped)
+  is <- match(ped$sire, ped$id)
+  id <- match(ped$dam,  ped$id)
+  gen <- integer(n)
+  for (iter in seq_len(n + 1)) {
+    new_gen <- pmax(ifelse(is.na(is), 0L, gen[is] + 1L),
+                    ifelse(is.na(id), 0L, gen[id] + 1L))
+    if (all(new_gen == gen)) break
+    if (iter > n) stop("Pedigree loop detected: an animal is its own ancestor.")
+    gen <- new_gen
+  }
+
+  ped <- ped[order(gen, seq_len(n)), , drop = FALSE]
+  ped$n <- seq_len(nrow(ped))
+  ped$s <- match(ped$sire, ped$id, nomatch = 0L)
+  ped$d <- match(ped$dam,  ped$id, nomatch = 0L)
+  rownames(ped) <- NULL
+  ped
+}
+```
+
+```{r}
+#| label: ped8
+ped8 <- prepare_pedigree(data.frame(
+  id   = c("1", "2", "3", "4", "5", "6", "7", "8"),
+  sire = c("0", "0", "0", "1", "3", "1", "4", "3"),
+  dam  = c("0", "0", "0", "0", "2", "2", "5", "6")))   # "0" = unknown parent
+ped8
+```
+
+Columns `s` and `d` are the row numbers of each parent (0 = unknown).
+
+## The relationship matrix A
+
+The **relationship matrix A** has one row and one column per animal. Each cell is the expected proportion of genes two animals share because they inherited them from the same ancestors (**identical by descent**). A calf got half its genes from its sire, so their relationship is 0.5. Technically A is twice the coancestry (kinship) coefficient.
+
+A is built row by row: an animal's relationship to anyone is the average of its two parents' relationships to that animal.
+
+```{r}
+#| label: fn-make_A
+# Numerator relationship matrix A (the "tabular method").
+# A[i,j] = additive genetic relationship: the expected proportion of genes
+#          that i and j share identical by descent (inherited from the same
+#          ancestor). Parent-offspring 0.5, full sibs 0.5, half sibs 0.25.
+#          Formally, twice the coancestry (kinship) coefficient.
+# A[i,i] = 1 + F_i, where F_i is the inbreeding coefficient of i.
+make_A <- function(s, d) {
+  n <- length(s)
+  A <- matrix(0, n, n)
+  for (i in seq_len(n)) {
+    if (i > 1) {
+      j <- seq_len(i - 1)
+      a <- numeric(i - 1)
+      if (s[i] > 0) a <- a + 0.5 * A[j, s[i]]
+      if (d[i] > 0) a <- a + 0.5 * A[j, d[i]]
+      A[j, i] <- a
+      A[i, j] <- a
+    }
+    A[i, i] <- 1 + if (s[i] > 0 && d[i] > 0) 0.5 * A[s[i], d[i]] else 0
+  }
+  A
+}
+```
+
+```{r}
+#| label: A8
+A8 <- make_A(ped8$s, ped8$d)
+dimnames(A8) <- list(ped8$id, ped8$id)
+A8
+```
+
+| Relationship | Value in A | Example above |
+|---|---|---|
+| Itself (diagonal) | 1 + F | all 1: nobody here is inbred |
+| Parent and offspring | 0.5 | 1 and 4 |
+| Full siblings | 0.5 | none here |
+| Half siblings | 0.25 | 5 and 6 (same dam, 2) |
+| Grandparent and grandchild | 0.25 | 1 and 7 |
+| No known common ancestor | 0 | 4 and 5 |
+
+**F** is the **inbreeding coefficient**: the probability that an animal's two copies of a gene are identical because its parents are related. It equals half the relationship between the parents, and A's diagonal is 1 + F.
+
+## A-inverse
+
+The models in the next lessons need the inverse of A, written A⁻¹. Henderson (1976) found rules that write A⁻¹ directly from the pedigree, one animal at a time; Quaas (1976) extended them to inbred animals. Our version takes F from A to keep things short. Large programs compute F without building A (Meuwissen & Luo 1992).
+
+```{r}
+#| label: fn-make_Ainv
+# Inverse of A written directly from the pedigree: Henderson (1976) rules,
+# extended for inbreeding by Quaas (1976). F = inbreeding coefficients.
+# Here we take F from diag(A) - 1 for simplicity; large programs compute F
+# without building A (Meuwissen & Luo 1992).
+make_Ainv <- function(s, d, F = rep(0, length(s))) {
+  n <- length(s)
+  Ainv <- matrix(0, n, n)
+  for (i in seq_len(n)) {
+    p <- c(s[i], d[i])
+    p <- p[p > 0]                         # known parents
+    # variance of the Mendelian sampling term (the "luck of the draw")
+    v <- if (length(p) == 2) 0.5 - 0.25 * (F[p[1]] + F[p[2]])
+         else if (length(p) == 1) 0.75 - 0.25 * F[p]
+         else 1
+    k <- c(i, p)
+    w <- c(1, rep(-0.5, length(p)))
+    Ainv[k, k] <- Ainv[k, k] + (1 / v) * outer(w, w)
+  }
+  Ainv
+}
+```
+
+```{r}
+#| label: Ainv8
+Ainv8 <- make_Ainv(ped8$s, ped8$d, F = diag(A8) - 1)
+max(abs(Ainv8 - solve(A8)))   # identical to inverting A directly
+round(Ainv8, 3)
+```
+
+A⁻¹ is mostly zeros (`r round(100 * mean(abs(Ainv8) < 1e-12))`% here), because each animal only connects to its parents and mates. In a real population almost every entry is zero, which is how software handles millions of animals.
+
+::: {.callout-warning title="Pedigree quality matters"}
+A wrong or missing sire makes relatives look unrelated (exercise 3 shows it). Pedigree errors flow straight into every EBV, so checking the pedigree is usually the first and longest job on real data.
+:::
+
+::: {.callout-tip title="Exercises (script: 01_relationships.R)"}
+1. Which pairs have the largest relationship, ignoring the diagonal? What kind of relatives are they all?
+2. Add a 9th animal with sire 7 and dam 8. What is its inbreeding coefficient, and why is it above zero?
+3. Change animal 5's sire to `"0"` (unknown). Which relationships change? What does that tell you about missing pedigree data?
+:::
+
+```{r}
+#| label: ans1
+#| include: false
+A2 <- A8; diag(A2) <- 0
+top <- which(A2 == max(A2) & upper.tri(A2), arr.ind = TRUE)
+top_pairs <- paste(rownames(A8)[top[, 1]], colnames(A8)[top[, 2]], sep = "–")
+ped9 <- prepare_pedigree(data.frame(id = as.character(1:9),
+  sire = c(0, 0, 0, 1, 3, 1, 4, 3, 7), dam = c(0, 0, 0, 0, 2, 2, 5, 6, 8)))
+F9 <- diag(make_A(ped9$s, ped9$d))[9] - 1
+pedx <- prepare_pedigree(data.frame(id = as.character(1:8),
+  sire = c(0, 0, 0, 1, 0, 1, 4, 3), dam = c(0, 0, 0, 0, 2, 2, 5, 6)))
+Ax <- make_A(pedx$s, pedx$d); dimnames(Ax) <- dimnames(A8)
+ch <- which(abs(Ax - A8) > 1e-9 & upper.tri(A8), arr.ind = TRUE)
+changes <- paste0(rownames(A8)[ch[, 1]], "–", colnames(A8)[ch[, 2]], " (",
+                  A8[ch], " → ", Ax[ch], ")", collapse = ", ")
+```
+
+::: {.callout-note collapse="true" title="Answers (try the exercises first)"}
+1. `r length(top_pairs)` pairs share the top value of `r max(A2)`, and all are parent and offspring: `r paste(top_pairs, collapse = ", ")`.
+2. F = `r F9`. Its parents 7 and 8 are related (A = `r A8["7", "8"]`) through the common ancestors 1, 2 and 3, and F is half the parents' relationship.
+3. These relationships fall: `r changes`. Missing parents make animals look less related than they are, so less information is shared between relatives and inbreeding is underestimated.
+:::
+
+# Lesson 2: BLUP by hand {#sec-l2}
+
+**BLUP** stands for Best Linear Unbiased Prediction. Write the idea from Lesson 1 for every record at once. This is the **animal model**:
+
+$$
+\mathbf{y} = \mathbf{X}\mathbf{b} + \mathbf{Z}\mathbf{a} + \mathbf{e}
+$$
+
+| Symbol | Plain words | Here |
+|---|---|---|
+| $\mathbf{y}$ | The measurements | 5 pre-weaning gains (kg) |
+| $\mathbf{b}$ | **Fixed effects**: groups we correct for | sex |
+| $\mathbf{a}$ | **Random animal effects**: the breeding values we want | 8 animals, 3 without a record |
+| $\mathbf{X}$, $\mathbf{Z}$ | Tables of 0s and 1s saying which group and which animal each record belongs to | 5×2 and 5×8 |
+| $\mathbf{e}$ | Residual: everything else | |
+
+::: {.callout-note title="The R you need for this lesson"}
+| Code | Meaning |
+|---|---|
+| `t(X)` | transpose: rows become columns |
+| `X %*% Y` | matrix multiplication |
+| `solve(L, R)` | solve the set of equations L x = R for x |
+| `solve(L)` | the inverse of L |
+| `model.matrix(~ 0 + sex, data)` | one 0/1 column per level of sex (`0 +` means no intercept) |
+:::
+
+```{r}
+#| label: fn-make_Z
+# Z: one row per record, one column per animal, a 1 where they match.
+make_Z <- function(record_ids, animal_ids) {
+  col <- match(record_ids, animal_ids)
+  if (anyNA(col)) stop("Records for animals not in the relationship matrix: ",
+                       paste(head(record_ids[is.na(col)]), collapse = ", "))
+  Z <- matrix(0, length(record_ids), length(animal_ids))
+  Z[cbind(seq_along(col), col)] <- 1
+  Z
+}
+```
+
+```{r}
+#| label: data8
+phen8 <- data.frame(id  = c("4", "5", "6", "7", "8"),
+                    sex = c("M", "F", "F", "M", "M"),
+                    wwg = c(4.5, 2.9, 3.9, 3.5, 5.0))
+sigma2_a8 <- 20; sigma2_e8 <- 40          # h2 = 20 / 60 = 0.33
+
+X8 <- model.matrix(~ 0 + sex, data = phen8)[, , drop = FALSE]
+Z8 <- make_Z(phen8$id, ped8$id)
+dimnames(Z8) <- list(phen8$id, ped8$id)
+X8
+Z8
+```
+
+Animals 1 to 3 have all-zero columns in Z: no record. They still get a breeding value, learned from their offspring.
+
+## The mixed model equations
+
+Henderson showed that the best estimates come from one set of linear equations, the **mixed model equations** (MME):
+
+$$
+\begin{bmatrix} \mathbf{X}'\mathbf{X} & \mathbf{X}'\mathbf{Z} \\ \mathbf{Z}'\mathbf{X} & \mathbf{Z}'\mathbf{Z} + \mathbf{A}^{-1}\alpha \end{bmatrix}
+\begin{bmatrix} \hat{\mathbf{b}} \\ \hat{\mathbf{a}} \end{bmatrix} =
+\begin{bmatrix} \mathbf{X}'\mathbf{y} \\ \mathbf{Z}'\mathbf{y} \end{bmatrix},
+\qquad \alpha = \frac{\sigma^2_e}{\sigma^2_a}
+$$
+
+$\sigma^2_a$ is the **additive genetic variance** (how much breeding values vary) and $\sigma^2_e$ the **residual variance**. You do not need the algebra. Three things matter:
+
+- $\mathbf{A}^{-1}$ is where relatives come in.
+- $\alpha$ is noise relative to genetics. A large $\alpha$ means "records are noisy, shrink hard".
+- In R it is a few lines: build the left side, build the right side, call `solve()`.
+
+```{r}
+#| label: mme8
+A8inv <- Ainv8
+alpha <- sigma2_e8 / sigma2_a8
+y8 <- phen8$wwg
+LHS <- rbind(cbind(t(X8) %*% X8, t(X8) %*% Z8),
+             cbind(t(Z8) %*% X8, t(Z8) %*% Z8 + A8inv * alpha))
+RHS <- c(t(X8) %*% y8, t(Z8) %*% y8)
+round(LHS, 2)
+sol <- solve(LHS, RHS)
+names(sol) <- c(colnames(X8), paste0("animal_", ped8$id))
+round(sol, 3)
+```
+
+The textbook gives sex effects of 4.358 (male) and 3.404 (female), and animal solutions 0.098, −0.019, −0.041, −0.009, −0.186, 0.177, −0.249 and 0.183. We match within 0.001 (our male effect is `r sprintf("%.4f", sol["sexM"])`).
+
+## Reliability
+
+An EBV is an estimate, so it comes with uncertainty. The **prediction error variance** (PEV) measures how uncertain an EBV still is. **Reliability** turns it into a number from 0 (no information) to 1 (certain):
+
+$$
+\text{reliability}_i = 1 - \frac{\text{PEV}_i}{(1 + F_i)\,\sigma^2_a}
+$$
+
+$(1 + F_i)\sigma^2_a$ is how much animal $i$'s breeding value could vary before we knew anything. `solve_mme()` wraps the steps above and computes reliabilities. We use it from now on.
+
+```{r}
+#| label: fn-solve_mme
+# Mixed model equations (Henderson):
+#   y = Xb + Zu + e,  var(u) = K * sigma2_a,  var(e) = I * sigma2_e
+#   [ X'X   X'Z              ] [b]   [X'y]
+#   [ Z'X   Z'Z + Kinv*alpha ] [u] = [Z'y]      alpha = sigma2_e / sigma2_a
+# K is A (BLUP), G (GBLUP) or H (ssGBLUP); only Kinv changes between methods.
+# Reliability = 1 - PEV / (K_ii * sigma2_a), PEV = prediction error variance.
+# Kdiag = diag(K): 1 + F for A, diag(G) for GBLUP, diag(H) for ssGBLUP.
+solve_mme <- function(y, X, Z, Kinv, sigma2_a, sigma2_e, Kdiag = 1, reliability = TRUE) {
+  alpha <- sigma2_e / sigma2_a
+  XtX <- crossprod(X); XtZ <- crossprod(X, Z); ZtZ <- crossprod(Z)
+  LHS <- rbind(cbind(XtX,    XtZ),
+               cbind(t(XtZ), ZtZ + Kinv * alpha))
+  RHS <- c(crossprod(X, y), crossprod(Z, y))
+  nb  <- ncol(X)
+  iu  <- nb + seq_len(ncol(Z))
+  rel <- NULL
+  if (reliability) {
+    C   <- solve(LHS)                     # inverse of LHS (fine for small data)
+    sol <- drop(C %*% RHS)
+    pev <- diag(C)[iu] * sigma2_e
+    rel <- 1 - pev / (Kdiag * sigma2_a)
+    if (any(rel < -1e-6)) warning("Negative reliabilities: check Kdiag, variances and the model.")
+  } else {
+    sol <- solve(LHS, RHS)
+  }
+  list(fixed = setNames(sol[seq_len(nb)], colnames(X)),
+       ebv = sol[iu], rel = rel)
+}
+```
+
+```{r}
+#| label: fit8
+fit8 <- solve_mme(y8, X8, Z8, Ainv8, sigma2_a8, sigma2_e8, Kdiag = diag(A8))
+res8 <- data.frame(animal = ped8$id,
+                   sex = c("M", "F", "M", phen8$sex),
+                   own_gain = phen8$wwg[match(ped8$id, phen8$id)],
+                   ebv = round(fit8$ebv, 3),
+                   reliability = round(fit8$rel, 3))
+res8
+```
+
+What to notice:
+
+- Calf 4 gained 4.5 kg and heifer 6 only 3.9 kg, yet calf 6 has the higher EBV (`r res8$ebv[6]` vs `r res8$ebv[4]`). Males gain about `r f1(diff(fit8$fixed))` kg more on average, so 4.5 kg is ordinary for a male and 3.9 kg is good for a female. The fixed effect does its job.
+- Founders 1 to 3 get EBVs from their offspring alone, with the lowest reliabilities.
+- All reliabilities are low because the data are tiny.
+
+::: {.callout-tip title="Exercises (script: 02_blup_by_hand.R)"}
+1. Set $\sigma^2_a$ = 40 and $\sigma^2_e$ = 20 (h² = 0.67). Do the EBVs get bigger or smaller? Why?
+2. Calf 7's gain should be 5.5 kg. Which EBVs change? Why does calf 4 (its sire) go *down*? Hint: look at the male estimate.
+3. Remove the sex effect (`X8 <- matrix(1, 5, 1)`). How does the ranking of calves 4 and 6 change?
+:::
+
+```{r}
+#| label: ans2
+#| include: false
+e_h2 <- solve_mme(y8, X8, Z8, Ainv8, 40, 20, Kdiag = diag(A8))$ebv
+y8b  <- y8; y8b[4] <- 5.5
+f_y  <- solve_mme(y8b, X8, Z8, Ainv8, sigma2_a8, sigma2_e8, Kdiag = diag(A8))
+e_mu <- solve_mme(y8, matrix(1, 5, 1), Z8, Ainv8, sigma2_a8, sigma2_e8, Kdiag = diag(A8))$ebv
+dchg <- f_y$ebv - fit8$ebv
+ord  <- order(-abs(dchg))
+```
+
+::: {.callout-note collapse="true" title="Answers (try the exercises first)"}
+1. Bigger, roughly double (calf 8: `r f3(fit8$ebv[8])` → `r f3(e_h2[8])`; calf 7: `r f3(fit8$ebv[7])` → `r f3(e_h2[7])`). With higher heritability a record says more about genetics, so there is less shrinkage.
+2. Every EBV changes, because the sex estimates move too. The biggest changes are for animals `r paste(ped8$id[ord[1:3]], collapse = ", ")` (`r paste(sprintf("%+.3f", dchg[ord[1:3]]), collapse = ", ")`): calf 7 itself, and relatives close to it. Sire 4 moves from `r f3(fit8$ebv[4])` to `r f3(f_y$ebv[4])` because the male average rises from `r f3(fit8$fixed["sexM"])` to `r f3(f_y$fixed["sexM"])`, so 4's own 4.5 kg looks less impressive.
+3. With an overall mean only, calf 4 (`r f3(e_mu[4])`) overtakes heifer 6 (`r f3(e_mu[6])`). Ignoring sex credits male calves for a sex difference.
+:::
+
+# Lesson 3: A full herd evaluation {#sec-l3}
+
+The maths is the same as Lesson 2. What is new is the workflow, the one you will use on real data: **check → prepare → estimate variances → solve → check the results**.
+
+## The practice herd
+
+We simulate a beef herd recorded for weaning weight. Because it is simulated, we know every animal's **true** breeding value and can grade each method later. The scripts read exactly the same data from the files in `data/`.
+
+```{r}
+#| label: fn-simulate_herd
+#| code-fold: true
+#| code-summary: "Show the simulation code (optional reading)"
+# Simulated beef herd recorded for weaning weight (kg). Returns a list with
+# pedigree, phenotypes, genotypes (matrix), true breeding values, and the
+# founders' allele frequencies (unknowable in real life; used in Section 7).
+#  * 5 chromosomes x 600 SNPs, 100 of them affect the trait (QTL)
+#  * h2 = 0.30 (sigma2_a = 90, sigma2_e = 210)
+#  * generation 0: 10 bulls + 100 cows; generations 1-3: 300 calves each
+#  * each generation: the 10 heaviest bull calves become sires, 100 random heifers dams
+#  * contemporary groups = herd x generation, with random environmental effects
+#  * generation 3 calves have no weights: they are the selection candidates
+#  * genotyped: all sires used, all generation 3 calves, 40% of generations 1-2
+simulate_herd <- function(seed = 2026, n_chr = 5, snp_per_chr = 600, n_qtl = 100,
+                          sigma2_a = 90, sigma2_e = 210, sd_cg = 8) {
+  set.seed(seed)
+  n_snp <- n_chr * snp_per_chr
+  chr <- rep(seq_len(n_chr), each = snp_per_chr)
+  pos <- unlist(lapply(seq_len(n_chr), function(i) sort(runif(snp_per_chr))))  # Morgans
+  make_gamete <- function(h1, h2) {          # one recombined copy of a parent's genome
+    out <- integer(n_snp)
+    for (c in seq_len(n_chr)) {
+      k  <- which(chr == c)
+      xo <- sort(runif(rpois(1, 1)))         # about 1 crossover per chromosome
+      strand <- (sample(0:1, 1) + findInterval(pos[k], xo)) %% 2
+      out[k] <- ifelse(strand == 0, h1[k], h2[k])
+    }
+    out
+  }
+
+  mu <- 240
+  herd_eff <- c(H1 = 0, H2 = 12, H3 = -8, H4 = 5)
+  sex_eff  <- c(F = 0, M = 15)
+  n_sires <- 10; n_dams <- 100; calves_per_dam <- 3; n_gen <- 3
+  n_per_gen <- n_dams * calves_per_dam
+  nf <- n_sires + n_dams
+  n_total <- nf + n_gen * n_per_gen
+
+  id   <- sprintf("A%04d", seq_len(n_total))
+  sire <- dam <- rep("0", n_total)
+  sex  <- c(rep("M", n_sires), rep("F", n_dams), rep(NA, n_gen * n_per_gen))
+  generation <- c(rep(0L, nf), rep(NA_integer_, n_gen * n_per_gen))
+
+  H1 <- H2 <- matrix(0L, n_total, n_snp)
+  p0 <- runif(n_snp, 0.05, 0.95)              # founder allele frequencies
+  H1[1:nf, ] <- matrix(rbinom(nf * n_snp, 1, rep(p0, each = nf)), nf, n_snp)
+  H2[1:nf, ] <- matrix(rbinom(nf * n_snp, 1, rep(p0, each = nf)), nf, n_snp)
+
+  qtl <- sort(sample(n_snp, n_qtl))
+  eff <- rnorm(n_qtl)
+  eff <- eff * sqrt(sigma2_a / sum(2 * p0[qtl] * (1 - p0[qtl]) * eff^2))
+  tbv_of <- function(rows) drop((H1[rows, qtl, drop = FALSE] + H2[rows, qtl, drop = FALSE] -
+                                 rep(2 * p0[qtl], each = length(rows))) %*% eff)
+
+  herd <- sample(names(herd_eff), n_total, replace = TRUE)
+  cg_eff <- herd_eff + matrix(rnorm(4 * n_gen, 0, sd_cg), 4, n_gen,
+                              dimnames = list(names(herd_eff), 0:(n_gen - 1)))  # herd x generation
+  tbv <- numeric(n_total)
+  y   <- rep(NA_real_, n_total)
+  tbv[1:nf] <- tbv_of(1:nf)
+  phen_of <- function(rows) mu + cg_eff[cbind(herd[rows], as.character(generation[rows]))] +
+    sex_eff[sex[rows]] + tbv[rows] + rnorm(length(rows), 0, sqrt(sigma2_e))
+  founder_cows <- (n_sires + 1):nf
+  y[founder_cows] <- phen_of(founder_cows)
+
+  sires <- 1:n_sires; dams <- founder_cows; last <- nf
+  for (g in 1:n_gen) {
+    rows <- last + seq_len(n_per_gen)
+    dam_of  <- rep(dams, each = calves_per_dam)
+    sire_of <- sample(sires, n_per_gen, replace = TRUE)
+    for (k in seq_along(rows)) {
+      H1[rows[k], ] <- make_gamete(H1[sire_of[k], ], H2[sire_of[k], ])
+      H2[rows[k], ] <- make_gamete(H1[dam_of[k], ],  H2[dam_of[k], ])
+    }
+    sire[rows] <- id[sire_of]; dam[rows] <- id[dam_of]
+    sex[rows]  <- sample(c("M", "F"), n_per_gen, replace = TRUE)
+    generation[rows] <- g
+    tbv[rows] <- tbv_of(rows)
+    if (g < n_gen) y[rows] <- phen_of(rows)
+    males <- rows[sex[rows] == "M"]
+    sires <- males[order(-y[males])][1:n_sires]
+    dams  <- sample(rows[sex[rows] == "F"], n_dams)
+    last  <- max(rows)
+  }
+
+  used_sires <- unique(match(sire[sire != "0"], id))
+  young <- which(generation == n_gen)
+  mid   <- which(generation %in% 1:(n_gen - 1))
+  genotyped <- sort(unique(c(used_sires, young, mid[runif(length(mid)) < 0.40])))
+  M <- H1[genotyped, ] + H2[genotyped, ]
+  dimnames(M) <- list(id[genotyped], paste0("snp", seq_len(n_snp)))
+
+  has_y <- which(!is.na(y))
+  list(pedigree   = data.frame(id, sire, dam, sex, generation, stringsAsFactors = FALSE),
+       phenotypes = data.frame(id = id[has_y], herd = herd[has_y],
+                               generation = generation[has_y], sex = sex[has_y],
+                               cg = paste0(herd[has_y], "_G", generation[has_y]),
+                               weaning_wt = round(y[has_y], 1), stringsAsFactors = FALSE),
+       genotypes  = M,
+       true_bv    = data.frame(id, generation, true_bv = round(tbv, 3), stringsAsFactors = FALSE),
+       founder_freq = setNames(p0, colnames(M)))
+}
+```
+
+```{r}
+#| label: herd
+herd    <- simulate_herd(seed = 2026)
+ped_raw <- herd$pedigree
+phen    <- herd$phenotypes
+truth   <- herd$true_bv
+sapply(herd[1:4], NROW)
+```
+
+::: {.callout-note title="The herd in one paragraph"}
+`r format(nrow(ped_raw), big.mark = ",")` animals in four generations: 10 founder bulls and 100 founder cows (generation 0), then 300 calves per generation. `r nrow(phen)` animals have a weaning weight, in 4 herds. Each generation, the 10 heaviest bull calves become the next sires. Generation 3 calves have no weights yet: they are the young candidates we want to rank. `r nrow(herd$genotypes)` animals are genotyped for `r format(ncol(herd$genotypes), big.mark = ",")` SNPs. The true variances are $\sigma^2_a$ = 90 and $\sigma^2_e$ = 210 (h² = 0.30).
+:::
+
+## Check the data
+
+Never skip this. Most real problems are found here.
+
+```{r}
+#| label: check
+head(phen)
+summary(phen$weaning_wt)
+table(phen$cg, phen$sex)                   # every group has data, both sexes?
+stopifnot(all(phen$id %in% ped_raw$id))    # every recorded animal is in the pedigree
+```
+
+```{r}
+#| label: fig-hist
+#| fig-cap: "Weaning weights. Look for impossible values and odd shapes."
+#| fig-height: 3.5
+hist(phen$weaning_wt, breaks = 30, col = "grey80", border = "white",
+     main = NULL, xlab = "Weaning weight (kg)")
+```
+
+A **contemporary group** (column `cg`) is a set of animals raised together under the same conditions: here, the same herd and generation. Real groups are usually herd × year × season × management. Animals are compared only within their group, which removes differences in feed, weather and management.
+
+## Prepare the pedigree
+
+```{r}
+#| label: prep
+ped  <- prepare_pedigree(ped_raw)          # keeps the sex and generation columns
+A    <- make_A(ped$s, ped$d)
+dimnames(A) <- list(ped$id, ped$id)
+F    <- diag(A) - 1
+Ainv <- make_Ainv(ped$s, ped$d, F)
+c(animals = nrow(ped), mean_F = mean(F), max_F = max(F))
+```
+
+## Estimate the variances (REML)
+
+BLUP needs $\sigma^2_a$ and $\sigma^2_e$. On real data they are estimated first, with **REML** (restricted maximum likelihood): the values that make the observed weights most likely, given the pedigree and the fixed effects.
+
+```{r}
+#| label: fn-reml_animal
+# REML estimates of sigma2_a and sigma2_e for the animal model
+# y = Xb + Za + e, var(a) = K sigma2_a. Maximises the restricted likelihood
+# numerically. Fine for a few thousand records; real data use AIREMLF90,
+# ASReml, WOMBAT, etc.
+reml_animal <- function(y, X, Z, K) {
+  ev <- eigen(Z %*% K %*% t(Z), symmetric = TRUE)
+  d  <- pmax(ev$values, 0)
+  Uy <- drop(crossprod(ev$vectors, y))
+  UX <- crossprod(ev$vectors, X)
+  neg_loglik <- function(log_var) {
+    s2a <- exp(log_var[1]); s2e <- exp(log_var[2])
+    w   <- 1 / (s2a * d + s2e)                       # V = U diag(1/w) U'
+    XVX <- crossprod(UX, UX * w)
+    XVy <- crossprod(UX, Uy * w)
+    yPy <- sum(Uy^2 * w) - sum(XVy * solve(XVX, XVy))
+    0.5 * (-sum(log(w)) + determinant(XVX)$modulus[1] + yPy)
+  }
+  start <- log(rep(var(y) / 2, 2))
+  fit <- optim(start, neg_loglik, method = "BFGS")
+  v <- exp(fit$par)
+  c(sigma2_a = v[1], sigma2_e = v[2], h2 = v[1] / sum(v),
+    converged = fit$convergence == 0)
+}
+```
+
+```{r}
+#| label: reml
+X <- model.matrix(~ 0 + cg + sex, data = phen)[, , drop = FALSE]
+Z <- make_Z(phen$id, ped$id)
+y <- phen$weaning_wt
+vc <- reml_animal(y, X, Z, A)
+round(vc, 3)
+```
+
+The true values are 90 and 210 (h² = 0.30). REML gives h² = `r f2(vc["h2"])` from these `r nrow(phen)` records. Estimates from small data sets are rough: that is why national evaluations estimate variances from large data and reuse them for years. For the rest of the course we use the true values, so every lesson and script gives the same numbers.
+
+## Model and solve
+
+Weaning weight = contemporary group + sex + animal + residual. Contemporary group and sex are fixed effects.
+
+```{r}
+#| label: fit-blup
+sigma2_a <- 90; sigma2_e <- 210
+fit_blup <- solve_mme(y, X, Z, Ainv, sigma2_a, sigma2_e, Kdiag = 1 + F)
+round(fit_blup$fixed, 1)
+fit_reml <- solve_mme(y, X, Z, Ainv, vc["sigma2_a"], vc["sigma2_e"], reliability = FALSE)
+cor(fit_blup$ebv, fit_reml$ebv)            # rankings with true vs estimated variances
+```
+
+The `cg` estimates are the expected weight of a female calf of **base** genetic merit (the average founder) in each group, and `sexM` is how much heavier males are. The rankings with estimated and with true variances are almost the same (correlation `r f3(cor(fit_blup$ebv, fit_reml$ebv))`): rankings are robust to modest errors in the variances.
+
+## Check the results
+
+```{r}
+#| label: ebv-table
+ebv <- data.frame(id = ped$id, sire = ped$sire, dam = ped$dam, sex = ped$sex,
+                  generation = ped$generation,
+                  has_record = ped$id %in% phen$id,
+                  n_offspring = tabulate(c(ped$s, ped$d), nbins = nrow(ped)),
+                  ebv = round(fit_blup$ebv, 2),
+                  reliability = round(fit_blup$rel, 3))
+head(ebv[order(-ebv$ebv), ], 10)           # top 10
+aggregate(cbind(ebv, reliability) ~ generation, data = ebv, FUN = function(x) round(mean(x), 3))
+```
+
+```{r}
+#| label: fig-trend
+#| fig-cap: "EBV by generation. The rise is genetic progress from keeping the heaviest bull calves as sires."
+#| fig-height: 3.5
+boxplot(ebv ~ generation, data = ebv, col = "grey85",
+        xlab = "Generation", ylab = "EBV (kg)")
+abline(h = 0, lty = 2)
+```
+
+Sanity checks to make on every run:
+
+- The founders' average EBV is about 0: EBVs are measured from the base population.
+- The genetic trend is plausible for the trait and the selection.
+- Young animals without records have lower reliability.
+- On real data: the new EBVs correlate highly with the previous run's.
+
+```{r}
+#| label: fullsibs
+young_ebv <- ebv[ebv$generation == 3, ]
+fam  <- paste(young_ebv$sire, young_ebv$dam)
+pair <- young_ebv[fam == fam[duplicated(fam)][1], ][1:2, ]
+pair
+```
+
+::: {.callout-important title="The limit of pedigree BLUP"}
+A generation-3 calf has no record and no offspring, so its EBV is just the average of its parents' EBVs: the **parent average**. Full siblings like `r pair$id[1]` and `r pair$id[2]` get identical EBVs (`r pair$ebv[1]` kg). The pedigree cannot tell which sibling inherited the better genes. Which half of each parent's genes a calf receives is random (**Mendelian sampling**). DNA can see it.
+:::
+
+::: {.callout-tip title="Exercises (script: 03_blup_herd.R)"}
+1. Why are full siblings in generation 3 given identical EBVs? What information would separate them?
+2. Is there genetic progress? How many kg per generation? Hint: `coef(lm(ebv ~ generation, data = ebv))`.
+3. Is a high reliability the same as a high EBV? Find a bull (sex `"M"`) with high reliability but an average EBV. What gives him the high reliability?
+:::
+
+```{r}
+#| label: ans3
+#| include: false
+gain_est  <- coef(lm(ebv ~ generation, data = ebv))[2]
+gain_true <- coef(lm(true_bv ~ generation, data = truth))[2]
+bulls <- ebv[ebv$sex == "M" & ebv$reliability > 0.6, ]
+avg_bull <- bulls[which.min(abs(bulls$ebv)), ]
+```
+
+::: {.callout-note collapse="true" title="Answers (try the exercises first)"}
+1. With no record and no offspring, the EBV is the parent average, which is the same for full siblings. Their own records, their offspring's records, or genotypes would separate them.
+2. Yes: about `r f1(gain_est)` kg per generation from the EBVs (the true gain is `r f1(gain_true)` kg per generation).
+3. No. For example bull `r avg_bull$id` has reliability `r avg_bull$reliability` but an EBV of only `r avg_bull$ebv` kg. His reliability comes from his `r avg_bull$n_offspring` recorded offspring. Reliability measures confidence, not merit.
+:::
+
+# Lesson 4: GBLUP, using DNA {#sec-l4}
+
+An **allele** is one version of a gene or DNA position. Every animal carries two copies of each position, one from each parent. A **SNP** (single-nucleotide polymorphism) is a position where animals differ, and a SNP chip reads tens of thousands of them. Each animal gets a code per SNP: the number of copies of one chosen allele. 0 or 2 means **homozygous** (both copies the same), 1 means **heterozygous**. In the genotype file each animal is one line:
+
+```
+A0001 0211012222122111210221100222001001...
+```
+
+```{r}
+#| label: geno
+M <- herd$genotypes
+dim(M)
+M[1:5, 1:10]
+```
+
+**Quality control** removes SNPs where one allele is very rare (minor allele frequency, MAF, below 0.05) or with too many missing calls:
+
+```{r}
+#| label: fn-qc_genotypes
+# Quality control: drop SNPs with low minor-allele frequency (MAF) or too
+# many missing calls, then fill remaining missing calls with the SNP mean.
+qc_genotypes <- function(M, min_maf = 0.05, max_missing = 0.10, verbose = TRUE) {
+  p    <- colMeans(M, na.rm = TRUE) / 2
+  maf  <- pmin(p, 1 - p)
+  miss <- colMeans(is.na(M))
+  keep <- maf >= min_maf & miss <= max_missing
+  if (verbose) cat(sprintf("QC: kept %d of %d SNPs (%d low MAF, %d high missing)\n",
+              sum(keep), ncol(M), sum(maf < min_maf), sum(miss > max_missing)))
+  M <- M[, keep, drop = FALSE]
+  for (j in which(colSums(is.na(M)) > 0)) M[is.na(M[, j]), j] <- mean(M[, j], na.rm = TRUE)
+  M
+}
+```
+
+```{r}
+#| label: qc
+M <- qc_genotypes(M, min_maf = 0.05)
+```
+
+## The genomic relationship matrix G
+
+G has the same meaning as A, but it is *measured* from DNA instead of *expected* from the pedigree (VanRaden 2008):
+
+$$
+\mathbf{G} = \frac{\mathbf{W}\mathbf{W}'}{2\sum_j p_j(1-p_j)}, \qquad W_{ij} = \text{code}_{ij} - 2p_j
+$$
+
+where $p_j$ is the frequency of the counted allele at SNP $j$. Using the genotyped animals' own allele frequencies makes G measure relationships relative to the **current** population: the average pair is about 0, and many pairs are negative, meaning "less related than average".
+
+```{r}
+#| label: fn-make_G
+# Genomic relationship matrix G (VanRaden 2008, method 1). Same meaning as A,
+# but measured from DNA. p = allele frequencies used to centre the genotypes;
+# by default the frequencies in the genotyped animals themselves, which makes
+# G relative to the CURRENT population (many off-diagonals are negative).
+make_G <- function(M, p = colMeans(M) / 2) {
+  W <- sweep(M, 2, 2 * p)                 # centred genotypes: 0/1/2 minus 2p
+  G <- tcrossprod(W) / (2 * sum(p * (1 - p)))
+  dimnames(G) <- list(rownames(M), rownames(M))
+  G
+}
+```
+
+```{r}
+#| label: fn-is_half_sib
+#| code-fold: true
+#| code-summary: "Show is_half_sib()"
+# TRUE for pairs that share exactly one known parent (half sibs).
+is_half_sib <- function(sire, dam) {
+  ss <- outer(sire, sire, "==") & sire != "0"
+  dd <- outer(dam,  dam,  "==") & dam  != "0"
+  (ss & !dd) | (dd & !ss)
+}
+```
+
+```{r}
+#| label: G
+G   <- make_G(M)
+gi  <- match(rownames(G), ped$id)
+A22 <- A[gi, gi]                           # pedigree relationships, same animals
+up  <- upper.tri(G)
+hs  <- is_half_sib(ped$sire[gi], ped$dam[gi])[up]   # pairs sharing exactly one parent
+c(mean_offdiag = mean(G[up]), share_negative = mean(G[up] < 0))
+summary(G[up][hs])
+```
+
+```{r}
+#| label: fig-GvsA
+#| fig-cap: "Every pair of genotyped animals: relationship expected from the pedigree (A) and measured from DNA (G). Red line: G = A. G sits lower because it uses the current population as its base."
+plot(A22[up], G[up], pch = 16, cex = 0.3, col = rgb(0, 0, 0, 0.15),
+     xlab = "Pedigree relationship (A)", ylab = "Genomic relationship (G)")
+abline(0, 1, col = "red")
+```
+
+::: {.callout-note title="Why DNA helps"}
+The pedigree gives every half-sib pair exactly 0.25. G shows what really happened: here half-sib pairs range from `r f2(min(G[up][hs]))` to `r f2(max(G[up][hs]))`. That spread is Mendelian sampling, which half of each parent's DNA each calf received, and it is what lets genomics tell siblings apart.
+:::
+
+## GBLUP
+
+GBLUP is the same MME with $\mathbf{G}^{-1}$ in place of $\mathbf{A}^{-1}$. The weakness: only genotyped animals can be in the model. The genotyped animals with records are the **reference population**, the animals the prediction learns from.
+
+```{r}
+#| label: fit-gblup
+phen_g <- phen[phen$id %in% rownames(G), ]
+c(records_used = nrow(phen_g), records_total = nrow(phen))
+
+Gstar <- G + diag(0.01, nrow(G))           # tiny ridge so G can be inverted
+Xg <- model.matrix(~ 0 + cg + sex, data = phen_g)[, , drop = FALSE]
+Zg <- make_Z(phen_g$id, rownames(G))
+fit_gblup <- solve_mme(phen_g$weaning_wt, Xg, Zg, solve(Gstar), sigma2_a, sigma2_e,
+                       Kdiag = diag(Gstar))
+gebv <- data.frame(id = rownames(G), gebv = round(fit_gblup$ebv, 2),
+                   reliability = round(fit_gblup$rel, 3))
+gebv[gebv$id %in% pair$id, ]               # the full sibs from Lesson 3
+```
+
+The two full siblings now get different predictions. But `r nrow(phen) - nrow(phen_g)` of the `r nrow(phen)` weights are lost because those animals were not genotyped, including every founder cow.
+
+::: {.callout-tip title="Exercises (script: 04_gblup.R)"}
+1. Why do the two full siblings now get different GEBVs?
+2. Look at `diag(G)`. The values are not exactly 1. What does a value above 1 mean?
+3. Rerun QC with `min_maf = 0.20`. How many SNPs remain? Measure how far G is from A with `sd(G[up] - A22[up])` for both settings. Does G get noisier?
+:::
+
+```{r}
+#| label: ans4
+#| include: false
+M20 <- qc_genotypes(herd$genotypes, min_maf = 0.20, verbose = FALSE)
+G20 <- make_G(M20)
+sd05 <- sd(G[up] - A22[up]); sd20 <- sd(G20[up] - A22[up])
+```
+
+::: {.callout-note collapse="true" title="Answers (try the exercises first)"}
+1. G sees which chromosome segments each calf actually inherited, so full siblings are no longer identical.
+2. The diagonal ranges from `r f2(min(diag(G)))` to `r f2(max(diag(G)))` (mean `r f2(mean(diag(G)))`). Above 1 means the animal is more homozygous than average for this population: genomic inbreeding.
+3. `r ncol(M20)` SNPs remain. The spread of G around A goes from `r f3(sd05)` to `r f3(sd20)`, so G gets `r if (sd20 > sd05 * 1.05) "noisier" else "only slightly noisier"`. A few thousand SNPs is plenty for this small genome.
+:::
+
+# Lesson 5: Single-step GBLUP {#sec-l5}
+
+**Single-step GBLUP** keeps every animal and every record. It replaces A with a combined matrix **H**: pedigree relationships for everyone, corrected by DNA where DNA exists. Write $\mathbf{A}_{22}$ for the part of A that covers the genotyped animals only. Then (Legarra et al. 2009; Aguilar et al. 2010; Christensen & Lund 2010):
+
+$$
+\mathbf{H}^{-1} = \mathbf{A}^{-1} + \begin{bmatrix} \mathbf{0} & \mathbf{0} \\ \mathbf{0} & \mathbf{G}^{-1} - \mathbf{A}_{22}^{-1} \end{bmatrix}
+$$
+
+The formula is drawn with the genotyped animals in the last rows and columns. In the code they can sit anywhere: we just add the correction to their rows and columns. In words: start from the pedigree for everyone; for genotyped animals, **add** what the DNA says ($\mathbf{G}^{-1}$) and **subtract** what the pedigree already said about them ($\mathbf{A}_{22}^{-1}$), so nothing is counted twice.
+
+## Putting G and A on the same scale
+
+A measures relationships from the founders; G from the current population. Before combining them, `tune_G()` rescales G so its average diagonal and average off-diagonal match $\mathbf{A}_{22}$ (Vitezica et al. 2011), then mixes in 5% of $\mathbf{A}_{22}$ so it can be inverted. BLUPF90's defaults do the same. Lesson 6 shows that this helps but does not fully remove the mismatch.
+
+```{r}
+#| label: fn-tune_G
+# Put G on the same scale as A22 (pedigree relationships among genotyped
+# animals): G* = a + b*G with the same average diagonal and the same average
+# off-diagonal as A22 (Vitezica et al. 2011; BLUPF90 "TunedG 2"). Then blend
+# in a little A22 so G* can be inverted (BLUPF90 default: 95% G, 5% A22).
+tune_G <- function(G, A22, blend = 0.05, verbose = TRUE) {
+  m  <- rbind(c(1, mean(diag(G))), c(1, mean(G)))
+  ab <- solve(m, c(mean(diag(A22)), mean(A22)))
+  Gt <- ab[1] + ab[2] * G
+  if (verbose) cat(sprintf("Tuning G: G* = %.3f + %.3f * G, then %.0f%% A22 blended in\n",
+                           ab[1], ab[2], 100 * blend))
+  (1 - blend) * Gt + blend * A22
+}
+```
+
+## H-inverse and the solve
+
+```{r}
+#| label: fit-ss
+geno <- match(rownames(M), ped$id)        # positions of genotyped animals in the pedigree
+A22  <- A[geno, geno]
+Gt   <- tune_G(G, A22, blend = 0.05)
+
+Hinv <- Ainv
+Hinv[geno, geno] <- Hinv[geno, geno] + solve(Gt) - solve(A22)
+
+fit_ss <- solve_mme(y, X, Z, Hinv, sigma2_a, sigma2_e,
+                    Kdiag = diag(solve(Hinv)))   # same X, Z as Lesson 3
+round(fit_ss$fixed, 1)
+```
+
+The solve is identical to Lesson 3. Only `Ainv` became `Hinv` (and the reliabilities use the diagonal of H).
+
+```{r}
+#| label: rel-groups
+genotyped <- seq_along(ped$id) %in% geno
+group <- ifelse(ped$generation == 3, "generation-3 calves (genotyped, no record)",
+         ifelse(!genotyped, "not genotyped",
+         ifelse(ped$id %in% phen$id, "genotyped, with record", "genotyped founder bulls")))
+data.frame(animals = as.vector(table(group)),
+           BLUP    = round(tapply(fit_blup$rel, group, mean), 3),
+           ssGBLUP = round(tapply(fit_ss$rel,   group, mean), 3))
+```
+
+Genotyped young animals gain the most reliability. That is where genomics pays off in practice.
+
+::: {.callout-tip title="Exercises (script: 05_ssgblup.R)"}
+1. Founder cows (generation 0, sex F) are not genotyped. Do their EBVs change between BLUP and ssGBLUP? Compare the contemporary group estimates of the two runs too.
+2. Try `blend = 0.20` in `tune_G()`. What changes for the generation-3 calves?
+3. GBLUP used `r nrow(phen_g)` records; ssGBLUP uses all `r nrow(phen)`. Whose records did GBLUP throw away, and why does that matter for the young calves?
+:::
+
+```{r}
+#| label: fn-evaluate_prediction-early
+#| include: false
+# Validation statistics for one method:
+#  accuracy   = correlation between prediction and true BV (young animals)
+#  slope      = regression of true BV on prediction (1 = right spread)
+#  gain_error = estimated minus true genetic gain from the base generation
+#               to the young generation (0 = no level bias), in kg
+evaluate_prediction <- function(pred, true_bv, generation,
+                                young = max(generation), base = 0) {
+  y <- generation == young & !is.na(pred)
+  b <- generation == base  & !is.na(pred)
+  c(accuracy   = cor(pred[y], true_bv[y]),
+    slope      = unname(coef(lm(true_bv[y] ~ pred[y]))[2]),
+    gain_error = (mean(pred[y]) - mean(pred[b])) - (mean(true_bv[y]) - mean(true_bv[b])))
+}
+```
+
+```{r}
+#| label: ans5
+#| include: false
+fc <- which(ped$generation == 0 & ped$sex == "F")
+cg_shift <- mean(fit_ss$fixed[grep("^cg", names(fit_ss$fixed))] -
+                 fit_blup$fixed[grep("^cg", names(fit_blup$fixed))])
+fit_b20 <- local({
+  Gt20 <- tune_G(G, A22, blend = 0.20, verbose = FALSE)
+  H20 <- Ainv; H20[geno, geno] <- H20[geno, geno] + solve(Gt20) - solve(A22)
+  solve_mme(y, X, Z, H20, sigma2_a, sigma2_e, Kdiag = diag(solve(H20)))
+})
+tbv_ped <- truth$true_bv[match(ped$id, truth$id)]
+ev05 <- evaluate_prediction(fit_ss$ebv,  tbv_ped, ped$generation)
+ev20 <- evaluate_prediction(fit_b20$ebv, tbv_ped, ped$generation)
+y3 <- ped$generation == 3
+n_lost_cows <- sum(phen$generation == 0 & !(phen$id %in% rownames(G)))
+n_lost_mid  <- sum(phen$generation > 0 & !(phen$id %in% rownames(G)))
+```
+
+::: {.callout-note collapse="true" title="Answers (try the exercises first)"}
+1. Their ranking hardly changes (correlation `r f3(cor(fit_blup$ebv[fc], fit_ss$ebv[fc]))`), but the average EBV moves by `r f1(mean(fit_ss$ebv[fc] - fit_blup$ebv[fc]))` kg. The contemporary group estimates move by `r f1(cg_shift)` kg on average in the other direction: the two models put the base at slightly different levels.
+2. With blend = 0.20: accuracy `r f3(ev20["accuracy"])` (was `r f3(ev05["accuracy"])`), slope `r f2(ev20["slope"])` (was `r f2(ev05["slope"])`), genetic gain error `r f1(ev20["gain_error"])` kg (was `r f1(ev05["gain_error"])`), and mean reported reliability `r f3(mean(fit_b20$rel[y3]))` (was `r f3(mean(fit_ss$rel[y3]))`). More pedigree in G gives the genomic information less weight, which shows in the reported reliability. Changes in accuracy of this size are within the herd-to-herd noise seen in Lesson 6.
+3. The `r n_lost_cows + n_lost_mid` records of non-genotyped animals: `r n_lost_cows` founder cows and `r n_lost_mid` animals from generations 1 and 2. They are the dams and granddams of the young calves, so GBLUP loses part of the calves' family information.
+:::
+
+# Lesson 6: Which method wins? {#sec-l6}
+
+We grade each method on the 300 generation-3 calves against their true breeding values. With real data the truth is never known: breeders hide the latest records, predict them, and compare (a **validation**; the standard approach is the LR method of Legarra & Reverter 2018). Three statistics:
+
+- **Accuracy**: correlation between predicted and true breeding value. Higher means better ranking.
+- **Slope** (dispersion): regression of true on predicted value. 1 is ideal. Below 1, predictions are too spread out and over-promise; above 1, too cautious.
+- **Gain error**: estimated genetic gain from generation 0 to 3, minus the true gain (kg). 0 means no **level bias**. Accuracy and slope cannot detect a level bias, because they ignore the average.
+
+```{r}
+#| label: fn-evaluate_prediction
+# Validation statistics for one method:
+#  accuracy   = correlation between prediction and true BV (young animals)
+#  slope      = regression of true BV on prediction (1 = right spread)
+#  gain_error = estimated minus true genetic gain from the base generation
+#               to the young generation (0 = no level bias), in kg
+evaluate_prediction <- function(pred, true_bv, generation,
+                                young = max(generation), base = 0) {
+  y <- generation == young & !is.na(pred)
+  b <- generation == base  & !is.na(pred)
+  c(accuracy   = cor(pred[y], true_bv[y]),
+    slope      = unname(coef(lm(true_bv[y] ~ pred[y]))[2]),
+    gain_error = (mean(pred[y]) - mean(pred[b])) - (mean(true_bv[y]) - mean(true_bv[b])))
+}
+```
+
+```{r}
+#| label: compare
+tbv  <- truth$true_bv[match(ped$id, truth$id)]
+pred <- list(BLUP    = fit_blup$ebv,
+             GBLUP   = fit_gblup$ebv[match(ped$id, rownames(G))],   # NA if not genotyped
+             ssGBLUP = fit_ss$ebv)
+this_herd <- t(sapply(pred, evaluate_prediction, true_bv = tbv, generation = ped$generation))
+round(this_herd, 3)
+```
+
+```{r}
+#| label: fig-compare
+#| fig-cap: "Predicted and true breeding values for the 300 generation-3 calves. Red: regression line."
+#| fig-width: 9
+#| fig-height: 3.4
+y3 <- ped$generation == 3
+op <- par(mfrow = c(1, 3), mar = c(4, 4, 2, 1))
+for (m in names(pred)) {
+  plot(pred[[m]][y3], tbv[y3], pch = 16, col = rgb(0.1, 0.3, 0.6, 0.4),
+       xlab = paste("Predicted,", m), ylab = "True breeding value",
+       main = sprintf("%s  r = %.2f", m, this_herd[m, "accuracy"]))
+  abline(lm(tbv[y3] ~ pred[[m]][y3]), col = "red")
+}
+par(op)
+```
+
+```{r}
+#| label: winner
+#| include: false
+winner <- rownames(this_herd)[which.max(this_herd[, "accuracy"])]
+```
+
+In this herd, **`r winner`** has the highest accuracy (`r f3(max(this_herd[, "accuracy"]))`). But this is one herd of 300 calves. Is that result typical?
+
+## One herd is not enough
+
+`evaluate_herd()` simulates a new herd and fits all the methods. It also fits a fourth variant, explained below. We repeat it for 20 herds (script: `06b_replicates.R`; about a minute).
+
+```{r}
+#| label: fn-evaluate_herd
+#| code-fold: true
+#| code-summary: "Show evaluate_herd()"
+# Runs pedigree BLUP, GBLUP, ssGBLUP, and ssGBLUP with G built from the
+# founders' allele frequencies, on one simulated herd. Returns the
+# validation statistics for the youngest generation (used in Section 7).
+evaluate_herd <- function(seed, sigma2_a = 90, sigma2_e = 210) {
+  h <- simulate_herd(seed)
+  ped  <- prepare_pedigree(h$pedigree)
+  phen <- h$phenotypes
+  tbv  <- h$true_bv$true_bv[match(ped$id, h$true_bv$id)]
+  A    <- make_A(ped$s, ped$d)
+  Ainv <- make_Ainv(ped$s, ped$d, diag(A) - 1)
+  X <- model.matrix(~ 0 + cg + sex, data = phen)
+  Z <- make_Z(phen$id, ped$id)
+  y <- phen$weaning_wt
+  out <- list()
+  out$BLUP <- solve_mme(y, X, Z, Ainv, sigma2_a, sigma2_e, reliability = FALSE)$ebv
+
+  M <- qc_genotypes(h$genotypes, verbose = FALSE)
+  geno <- match(rownames(M), ped$id)
+  G <- make_G(M)
+  pg <- phen[phen$id %in% rownames(M), ]
+  fg <- solve_mme(pg$weaning_wt, model.matrix(~ 0 + cg + sex, data = pg),
+                  make_Z(pg$id, rownames(M)), solve(G + diag(0.01, nrow(G))),
+                  sigma2_a, sigma2_e, reliability = FALSE)
+  out$GBLUP <- rep(NA_real_, nrow(ped)); out$GBLUP[geno] <- fg$ebv
+
+  A22 <- A[geno, geno]; iA22 <- solve(A22)
+  ss <- function(Gx) {
+    Hinv <- Ainv; Hinv[geno, geno] <- Hinv[geno, geno] + solve(Gx) - iA22
+    solve_mme(y, X, Z, Hinv, sigma2_a, sigma2_e, reliability = FALSE)$ebv
+  }
+  out$ssGBLUP <- ss(tune_G(G, A22, verbose = FALSE))
+  G0 <- make_G(M, p = h$founder_freq[colnames(M)])
+  out$`ssGBLUP, founder frequencies` <- ss(0.95 * G0 + 0.05 * A22)
+
+  res <- t(sapply(out, evaluate_prediction, true_bv = tbv, generation = ped$generation))
+  data.frame(seed = seed, method = rownames(res), res, row.names = NULL)
+}
+```
+
+```{r}
+#| label: replicates
+#| cache: true
+reps <- do.call(rbind, lapply(1:20, evaluate_herd))
+```
+
+```{r}
+#| label: rep-summary
+ms <- function(x) sprintf("%.2f (%.2f)", mean(x), sd(x))
+data.frame(accuracy   = tapply(reps$accuracy,   reps$method, ms),
+           slope      = tapply(reps$slope,      reps$method, ms),
+           gain_error = tapply(reps$gain_error, reps$method, ms))
+wide <- reshape(reps[, c("seed", "method", "accuracy")], idvar = "seed",
+                timevar = "method", direction = "wide")
+c(GBLUP_beats_BLUP   = sum(wide$accuracy.GBLUP   > wide$accuracy.BLUP),
+  ssGBLUP_beats_BLUP = sum(wide$accuracy.ssGBLUP > wide$accuracy.BLUP),
+  herds = nrow(wide))
+```
+
+```{r}
+#| label: rep-vals
+#| include: false
+mm <- function(m, v) mean(reps[[v]][reps$method == m])
+sdm <- function(m, v) sd(reps[[v]][reps$method == m])
+n_g <- sum(wide$accuracy.GBLUP > wide$accuracy.BLUP)
+n_s <- sum(wide$accuracy.ssGBLUP > wide$accuracy.BLUP)
+```
+
+Mean (standard deviation) over 20 herds. What the replicates show:
+
+- **ssGBLUP is the most accurate on average** (`r f2(mm("ssGBLUP", "accuracy"))` against `r f2(mm("BLUP", "accuracy"))` for BLUP) and beats BLUP in `r n_s` of 20 herds. It uses every record and the DNA.
+- **GBLUP against BLUP is close**: GBLUP wins in `r n_g` of 20 herds. It gains from the DNA but loses all records of non-genotyped animals. GBLUP pulls ahead when the reference population is large; pedigree BLUP holds up when most records belong to non-genotyped animals.
+- **Herd-to-herd spread is large**: the SD of accuracy is about `r f2(sdm("BLUP", "accuracy"))`. A single herd, like ours, can put the methods in a different order.
+- **Slopes average close to 1** for all methods, with an SD of about `r f2(sdm("BLUP", "slope"))`. The slope of one herd should not be over-interpreted.
+
+## A bias that accuracy cannot see
+
+ssGBLUP underestimates genetic gain by `r f1(-mm("ssGBLUP", "gain_error"))` kg on average (out of a true gain of about `r f1(3 * gain_true)` kg over three generations), while BLUP is close to unbiased (`r f1(mm("BLUP", "gain_error"))` kg). The cause: A measures relationships from the founders, but G is built from the allele frequencies of the genotyped animals, which are recent and selected. Tuning G moves its averages toward A22 but does not fully align the two bases.
+
+The fourth method shows this. It builds G from the **founders'** allele frequencies, which only a simulation knows. Its gain error is `r f1(mm("ssGBLUP, founder frequencies", "gain_error"))` kg: the bias is gone. In real data, the remedies are **metafounders** (Legarra et al. 2015) or **unknown parent groups** (UPG), which model the founders' genetic level explicitly. Always check level bias, not only accuracy.
+
+::: {.callout-note title="Reported and realised reliability"}
+Reported reliability (from PEV) is measured against the base population's genetic variance. Within one generation of selected animals the true breeding values vary less, and the correlation inside that generation ignores information shared by the whole generation. So accuracy² within a cohort is usually lower than the average reported reliability. They are not expected to match.
+:::
+
+::: {.callout-tip title="Exercises (scripts: 06_compare.R, 06b_replicates.R)"}
+1. Which method wins in our herd? Is the difference larger than the herd-to-herd spread?
+2. In what situation would you expect GBLUP to beat pedigree BLUP?
+3. Which method has the largest gain error, and what causes it?
+:::
+
+```{r}
+#| label: ans6
+#| include: false
+gap <- sort(this_herd[, "accuracy"], decreasing = TRUE)
+```
+
+::: {.callout-note collapse="true" title="Answers (try the exercises first)"}
+1. `r winner`, ahead of `r names(gap)[2]` by `r f3(gap[1] - gap[2])`. The SD of accuracy across herds is about `r f2(sdm("BLUP", "accuracy"))`, so one herd cannot settle it; the 20-herd averages can.
+2. When many genotyped animals have their own records (a large reference population), or when the pedigree is poor or incomplete.
+3. ssGBLUP (`r f1(mm("ssGBLUP", "gain_error"))` kg on average). G and A use different bases: G uses the allele frequencies of the recent, selected genotyped animals. Building G from founder allele frequencies removes it; metafounders or UPG do this in real evaluations.
+:::
+
+# Lesson 7: Your own data and BLUPF90 {#sec-l7}
+
+## Checklist for a real evaluation
+
+1. **Files.** Pedigree: `id, sire, dam` (0 = unknown), plus birth date and sex. Phenotypes: `id`, the trait, and every variable used to build contemporary groups. Genotypes: one line per animal, `id` then a 0/1/2 string.
+2. **Pedigree checks.** Duplicate IDs, animals that are their own ancestor, parents born after their offspring, sires recorded as female, very large families.
+3. **Phenotype checks.** Impossible values, outliers (more than 3–4 SD from the group mean), weights at the wrong age, contemporary groups with only one animal or one sire (they carry no information for comparison), and whether groups are connected through shared sires.
+4. **Genotype checks.** Call rate per animal and per SNP, MAF, duplicate samples, and parentage conflicts between genotypes and pedigree.
+5. **Model.** Choose fixed effects (contemporary group, sex, age of dam, age at weighing) and random effects (animal; for weaning weight usually also a maternal genetic effect and a maternal permanent environment effect). Unknown parent groups or metafounders if many parents are missing or come from different populations.
+6. **Variances.** REML on a representative subset (AIREMLF90, ASReml, WOMBAT), or published estimates for the breed.
+7. **Solve and check convergence.** Large programs iterate; confirm the solver converged.
+8. **Check the results.** Base around 0, plausible genetic trend, reliabilities that rise with information, high correlation with the previous run, and a validation with the latest records hidden.
+
+## BLUPF90
+
+The R code stores full matrices, so it slows to a stop above roughly 10,000 animals. Production evaluations use software with sparse matrices and iterative solvers. The most common free option for single-step is **BLUPF90** (University of Georgia, <https://nce.ads.uga.edu>; free for research, check the licence for commercial use). `07_export_blupf90.R` writes the practice herd in BLUPF90 format with two parameter files. The single-step one:
+
+```
+DATAFILE
+phen.txt
+TRAITS
+4
+FIELDS_PASSED TO OUTPUT
+
+WEIGHT(S)
+
+RESIDUAL_VARIANCE
+210
+EFFECT
+2 cross alpha
+EFFECT
+3 cross alpha
+EFFECT
+1 cross alpha
+RANDOM
+animal
+FILE
+ped.txt
+FILE_POS
+1 2 3 0 0
+SNP_FILE
+geno.txt
+PED_DEPTH
+0
+(CO)VARIANCES
+90
+OPTION origID
+OPTION sol se
+```
+
+Columns of `phen.txt`: 1 animal, 2 contemporary group, 3 sex, 4 weaning weight.
+
+**Install.** Only two programs are needed: `renumf90` and `blupf90+` (which also builds G and H). Download them for your system from <https://nce.ads.uga.edu/html/projects/programs/> (Linux, Windows, or `Mac_OSX/64bit`) into the `blupf90/` folder. On macOS or Linux, make them executable with `chmod +x renumf90 blupf90+`. The Mac programs are built for Intel processors; on an Apple Silicon Mac they run through Rosetta 2, which macOS offers to install the first time (or run `softwareupdate --install-rosetta`).
+
+**Run.** In a terminal inside `blupf90/`:
+
+```bash
+./renumf90 renum_ssgblup.par   # renumbers IDs, checks genotypes, writes renf90.par
+./blupf90+ renf90.par          # builds H-inverse, solves, writes solutions.orig
+```
+
+**Compare with R** (after running Lesson 5, which writes `output/gebv_ssgblup.csv`):
+
+```{r}
+#| label: compare-blupf90
+#| eval: false
+sol <- read.table("blupf90/solutions.orig", header = TRUE,
+                  colClasses = c(original_id = "character"))
+ani <- sol[sol$effect == 3, ]              # effect 3 = animal
+r   <- read.csv("output/gebv_ssgblup.csv", colClasses = c(id = "character"))
+cor(ani$solution, r$gebv[match(ani$original_id, r$id)])
+```
+
+We ran both parameter files with BLUPF90+ on the practice herd. For pedigree BLUP and for ssGBLUP, every animal's solution agreed with the R lessons within 0.006 kg (the R output is rounded to 2 decimals), and BLUPF90's genotype QC removed the same 140 SNPs. Things to know when reading the output:
+
+- **`solutions.orig`** holds the results with original IDs, because of `OPTION origID`. Columns: trait, effect, level, original ID, solution, standard error. Effect 1 is the contemporary group, 2 sex, 3 the animal.
+- **Fixed effects are written differently.** BLUPF90 sets one level to zero (here males), so its contemporary group and sex solutions look different from R's. Differences between levels are identical: both give males 13.9 kg heavier, and contemporary group + female equals R's `cg` estimate exactly. Compare EBVs, not raw fixed-effect solutions.
+- **Inbreeding is included** in A⁻¹ by default (`renumf90` writes the coefficients to `renf90.inb`).
+- **G is tuned, then blended** 95% G with 5% A₂₂, as in Lesson 5. QC removes SNPs with MAF below 0.05 or call rate below 0.90, and animals with call rate below 0.90.
+- **`PED_DEPTH 0`** keeps the whole pedigree; the default keeps only 3 generations of ancestors.
+- **The free research version** handles up to 30,000 genotyped animals. Commercial users should check the licence.
+
+R packages such as `blupADC` and `breedR` can write the parameter files and call the programs from R, but they still need the BLUPF90 programs installed.
+
+## What the practice herd leaves out
+
+The simulation is built for teaching, so some things are simpler than real life:
+
+- **Generations, not years.** Every cow calves three times per generation, and generations do not overlap.
+- **Herds are assigned at random,** and contemporary groups are large and well connected.
+- **The founders are unrelated and from one population,** so unknown parent groups and metafounders are not needed for BLUP.
+- **The genome is short** (5 chromosomes). Relatives' DNA sharing therefore varies more than in real cattle, which makes genomics look better than it usually is.
+- **The SNPs that affect the trait are on the chip.** In reality they are only near some SNPs.
+- **One trait, no maternal effects.**
+
+# Glossary {.unnumbered}
+
+| Term | Meaning |
+|---|---|
+| Allele | One version of a gene or DNA position |
+| Breeding value (BV) | The value of an animal's genes to its offspring. Offspring are, on average, half the sire's BV plus half the dam's BV away from the population average. |
+| EBV / GEBV | Estimated breeding value, without or with genomic data |
+| EPD | Expected progeny difference, used in beef: half the EBV |
+| Heritability (h²) | Share of the variation, after correcting for fixed effects, due to additive genetic effects: $\sigma^2_a / (\sigma^2_a + \sigma^2_e)$ |
+| Fixed effect | A group effect we correct for: contemporary group, sex, age of dam |
+| Contemporary group | Animals raised together under the same conditions, compared only with each other |
+| Random effect | An effect drawn from a distribution, such as the breeding value. BLUP predicts these. |
+| PEV | Prediction error variance: how uncertain an EBV still is |
+| Reliability | $1 - \text{PEV}/((1+F)\sigma^2_a)$: 0 to 1, how much an EBV can be trusted. Says nothing about whether the EBV is high. |
+| Accuracy | Correlation between EBV and true BV. Beef (BIF) accuracy is defined differently: $1 - \sqrt{\text{PEV}/\sigma^2_a}$. |
+| Parent average | (sire EBV + dam EBV) / 2: the best guess with no information on the animal itself |
+| Mendelian sampling | The random half of each parent's genes an offspring receives. Why full siblings differ. |
+| Homozygous / heterozygous | Two identical copies of an allele / two different ones |
+| SNP | A DNA position where animals differ, coded 0/1/2 |
+| MAF | Minor allele frequency. SNPs with very low MAF are removed in QC. |
+| Reference population | Genotyped animals with records, from which genomic prediction learns |
+| A, G, H, A₂₂ | Relationships from pedigree, from genotypes, and from both; A₂₂ is the part of A for genotyped animals |
+| REML | Restricted maximum likelihood: the standard method to estimate variance components |
+| UPG / metafounders | Ways to model the genetic level of animals with unknown parents |
+| MME | Mixed model equations: the linear system every method here solves |
+| Maternal permanent environment | Non-genetic effect of a dam shared by all her calves (e.g. her udder) |
+
+# Further reading {.unnumbered}
+
+- Mrode, R. A. (2014). *Linear Models for the Prediction of Animal Breeding Values*, 3rd ed. CABI. Lesson 2 reproduces its Example 3.1. A 4th edition (Mrode & Pocrnic, 2023) is available.
+- Henderson, C. R. (1976). A simple method for computing the inverse of a numerator relationship matrix used in prediction of breeding values. *Biometrics* 32:69–83.
+- Quaas, R. L. (1976). Computing the diagonal elements and inverse of a large numerator relationship matrix. *Biometrics* 32:949–953.
+- Meuwissen, T. H. E. & Luo, Z. (1992). Computing inbreeding coefficients in large populations. *Genetics Selection Evolution* 24:305–313.
+- VanRaden, P. M. (2008). Efficient methods to compute genomic predictions. *Journal of Dairy Science* 91:4414–4423.
+- Legarra, A., Aguilar, I. & Misztal, I. (2009). A relationship matrix including full pedigree and genomic information. *Journal of Dairy Science* 92:4656–4663.
+- Aguilar, I. et al. (2010). Hot topic: A unified approach to utilize phenotypic, full pedigree, and genomic information for genetic evaluation of Holstein final score. *Journal of Dairy Science* 93:743–752.
+- Christensen, O. F. & Lund, M. S. (2010). Genomic prediction when some animals are not genotyped. *Genetics Selection Evolution* 42:2.
+- Vitezica, Z. G. et al. (2011). Bias in genomic predictions for populations under selection. *Genetics Research* 93:357–366.
+- Legarra, A. et al. (2015). Ancestral relationships using metafounders: finite ancestral populations and across population relationships. *Genetics* 200:455–468.
+- Legarra, A. & Reverter, A. (2018). Semi-parametric estimates of population accuracy and bias of predictions of breeding values and future phenotypes using the LR method. *Genetics Selection Evolution* 50:53.
+- Misztal, I. et al. BLUPF90 family of programs: manuals at <https://nce.ads.uga.edu>.

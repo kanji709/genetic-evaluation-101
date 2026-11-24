@@ -1,0 +1,16 @@
+# Rendered tutorial and Quarto build files (rebuild with: quarto render tutorial.qmd)
+tutorial.html
+tutorial_files/
+tutorial_cache/
+.quarto/
+
+# Files written by the lesson scripts
+output/
+blupf90/
+
+# R / RStudio / OS
+.Rhistory
+.RData
+.Rproj.user/
+Rplots.pdf
+.DS_Store
